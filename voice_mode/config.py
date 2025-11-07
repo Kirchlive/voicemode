@@ -602,10 +602,13 @@ AAC_BITRATE = os.getenv("VOICEMODE_AAC_BITRATE", "64k")  # Default 64kbps
 # ==================== STREAMING CONFIGURATION ====================
 
 # Streaming playback configuration
+# NOTE: These default values may be overridden by platform-specific settings
+# in platform_config.py for optimal performance on WSL/ALSA and macOS.
+# Use VOICEMODE_FORCE_PLATFORM env var to override platform detection.
 STREAMING_ENABLED = os.getenv("VOICEMODE_STREAMING_ENABLED", "true").lower() in ("true", "1", "yes", "on")
-STREAM_CHUNK_SIZE = int(os.getenv("VOICEMODE_STREAM_CHUNK_SIZE", "4096"))  # Download chunk size
-STREAM_BUFFER_MS = int(os.getenv("VOICEMODE_STREAM_BUFFER_MS", "150"))  # Initial buffer before playback
-STREAM_MAX_BUFFER = float(os.getenv("VOICEMODE_STREAM_MAX_BUFFER", "2.0"))  # Max buffer in seconds
+STREAM_CHUNK_SIZE = int(os.getenv("VOICEMODE_STREAM_CHUNK_SIZE", "4096"))  # Download chunk size (may be overridden)
+STREAM_BUFFER_MS = int(os.getenv("VOICEMODE_STREAM_BUFFER_MS", "150"))  # Initial buffer before playback (may be overridden)
+STREAM_MAX_BUFFER = float(os.getenv("VOICEMODE_STREAM_MAX_BUFFER", "2.0"))  # Max buffer in seconds (may be overridden)
 
 # ==================== EVENT LOGGING CONFIGURATION ====================
 

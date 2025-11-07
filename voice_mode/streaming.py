@@ -3,6 +3,11 @@ Streaming audio playback for voice-mode.
 
 This module provides progressive audio playback to reduce latency
 by playing audio chunks as they arrive from the TTS service.
+
+Platform-specific optimizations:
+- WSL/ALSA: Backpressure to prevent buffer overflow
+- macOS: Larger blocksizes to prevent crackling
+- Linux: Balanced settings
 """
 
 import asyncio
@@ -20,12 +25,10 @@ import sounddevice as sd
 from pydub import AudioSegment
 
 from .config import (
-    STREAM_CHUNK_SIZE,
-    STREAM_BUFFER_MS,
-    STREAM_MAX_BUFFER,
     SAMPLE_RATE,
     logger
 )
+from .platform_config import get_audio_config
 from .utils import get_event_logger
 
 # Opus decoder support (optional)
@@ -44,6 +47,9 @@ class StreamMetrics:
     generation_time: float = 0.0
     playback_time: float = 0.0
     buffer_underruns: int = 0
+    buffer_overflows: int = 0  # NEW: Track buffer overflow events
+    samples_dropped: int = 0  # NEW: Track dropped samples
+    backpressure_pauses: int = 0  # NEW: Track backpressure activations
     chunks_received: int = 0
     chunks_played: int = 0
     audio_path: Optional[str] = None  # Path to saved audio file
@@ -57,23 +63,31 @@ class AudioStreamPlayer:
         self.sample_rate = sample_rate
         self.channels = channels
         self.metrics = StreamMetrics()
-        
-        # Buffering
-        self.audio_queue = queue.Queue(maxsize=int(STREAM_MAX_BUFFER * sample_rate))
-        self.min_buffer_samples = int((STREAM_BUFFER_MS / 1000.0) * sample_rate)
-        
+
+        # Get platform-specific configuration
+        self.platform_config = get_audio_config()
+        logger.info(f"Using platform config: {self.platform_config.platform_name}")
+
+        # Buffering (use platform-specific max buffer)
+        max_queue_size = int(self.platform_config.stream_max_buffer * sample_rate)
+        self.audio_queue = queue.Queue(maxsize=max_queue_size)
+        self.min_buffer_samples = int((self.platform_config.stream_buffer_ms / 1000.0) * sample_rate)
+
+        logger.debug(f"Audio queue size: {max_queue_size} samples ({self.platform_config.stream_max_buffer}s), "
+                    f"min buffer: {self.min_buffer_samples} samples ({self.platform_config.stream_buffer_ms}ms)")
+
         # State
         self.playing = False
         self.finished_downloading = False
         self.playback_started = False
         self.start_time = time.perf_counter()
-        
+
         # Partial data buffer for format-specific decoding
         self.partial_data = b''
-        
+
         # Initialize decoder based on format
         self.decoder = self._get_decoder()
-        
+
         # Sounddevice stream
         self.stream = None
         self._lock = threading.Lock()
@@ -116,16 +130,17 @@ class AudioStreamPlayer:
             outdata.fill(0)
     
     async def start(self):
-        """Start the audio stream."""
+        """Start the audio stream with platform-optimized settings."""
+        blocksize = self.platform_config.blocksize
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             callback=self._audio_callback,
-            blocksize=1024,
+            blocksize=blocksize,
             dtype='float32'
         )
         self.stream.start()
-        logger.debug("Audio stream started")
+        logger.debug(f"Audio stream started (blocksize={blocksize})")
     
     async def add_chunk(self, chunk: bytes) -> bool:
         """Add an audio chunk for playback.
@@ -203,17 +218,24 @@ class AudioStreamPlayer:
         return None
     
     async def _queue_samples(self, samples: np.ndarray):
-        """Add samples to the playback queue."""
+        """Add samples to the playback queue with overflow tracking."""
         for sample in samples:
             try:
                 self.audio_queue.put_nowait(sample)
             except queue.Full:
                 # Buffer overflow - drop oldest samples
+                self.metrics.buffer_overflows += 1
                 try:
                     self.audio_queue.get_nowait()
                     self.audio_queue.put_nowait(sample)
+                    self.metrics.samples_dropped += 1
                 except queue.Empty:
                     pass
+
+        # Log warning if we're dropping samples
+        if self.metrics.samples_dropped > 0 and self.metrics.samples_dropped % 1000 == 0:
+            logger.warning(f"Buffer overflow: {self.metrics.samples_dropped} samples dropped, "
+                         f"{self.metrics.buffer_overflows} overflow events")
     
     async def finish(self):
         """Signal that downloading is complete."""
@@ -251,110 +273,136 @@ async def stream_pcm_audio(
     audio_dir: Optional[Path] = None,
     conversation_id: Optional[str] = None
 ) -> Tuple[bool, StreamMetrics]:
-    """Stream PCM audio with true HTTP streaming for minimal latency.
-    
-    Uses the OpenAI SDK's streaming response with iter_bytes() for real-time playback.
+    """Stream PCM audio with backpressure for stable playback.
+
+    Uses platform-optimized settings to prevent buffer overflow on WSL/ALSA
+    and crackling on macOS.
     """
     metrics = StreamMetrics()
+    platform_config = get_audio_config()
     start_time = time.perf_counter()
     stream = None
     first_chunk_time = None
     save_buffer = io.BytesIO() if save_audio else None
-    
+
+    # Backpressure control
+    pending_buffer = []  # Buffer for flow control
+    total_samples_written = 0
+    playback_start_time = None
+
     try:
-        # Setup sounddevice stream for PCM playback
-        # PCM parameters: 16-bit, mono, 24kHz (standard for TTS)
-        audio_started = False
-        audio_start_time = None
-        
-        def audio_callback(outdata, frames, time_info, status):
-            """Callback to track when audio actually starts playing."""
-            nonlocal audio_started, audio_start_time
-            if not audio_started and frames > 0:
-                audio_started = True
-                audio_start_time = time.perf_counter()
-        
+        # Setup sounddevice stream for PCM playback with platform settings
         stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,  # Standard TTS sample rate (24kHz)
+            samplerate=SAMPLE_RATE,
             channels=1,
-            dtype='int16'  # PCM is 16-bit integers
-            # Note: Can't use callback and write() together
+            dtype='int16',
+            blocksize=platform_config.blocksize
         )
         stream.start()
+
+        logger.debug(f"PCM stream started with blocksize={platform_config.blocksize}, "
+                    f"backpressure={'enabled' if platform_config.enable_backpressure else 'disabled'}")
         
-        # Log TTS playback start when we start the stream
+        # Log TTS playback start
         event_logger = get_event_logger()
         if event_logger:
             event_logger.log_event(event_logger.TTS_PLAYBACK_START)
-        
-        # Don't add stream parameter - Kokoro defaults to true, OpenAI doesn't support it
-        
-        logger.info("Starting true HTTP streaming with iter_bytes()")
-        
+
+        logger.info(f"Starting PCM streaming (platform: {platform_config.platform_name})")
+
         # Use the streaming response API
         async with openai_client.audio.speech.with_streaming_response.create(
             **request_params
         ) as response:
             chunk_count = 0
             bytes_received = 0
-            
+
             # Stream chunks as they arrive
-            async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+            async for chunk in response.iter_bytes(chunk_size=platform_config.stream_chunk_size):
                 if chunk:
                     # Track first chunk received
                     if first_chunk_time is None:
                         first_chunk_time = time.perf_counter()
                         chunk_receive_time = first_chunk_time - start_time
                         logger.info(f"First audio chunk received after {chunk_receive_time:.3f}s")
-                        
+
                         # Log TTS first audio event
-                        event_logger = get_event_logger()
                         if event_logger:
                             event_logger.log_event(event_logger.TTS_FIRST_AUDIO)
-                    
+
                     # Convert bytes to numpy array for sounddevice
-                    # PCM data is already in the right format
                     audio_array = np.frombuffer(chunk, dtype=np.int16)
-                    
-                    # Play the chunk immediately
-                    stream.write(audio_array)
-                    
+
                     # Save chunk if enabled
                     if save_buffer:
                         save_buffer.write(chunk)
-                    
+
                     chunk_count += 1
                     bytes_received += len(chunk)
                     metrics.chunks_received = chunk_count
-                    metrics.chunks_played = chunk_count
-                    
+
+                    # BACKPRESSURE: Check buffer status before writing
+                    if platform_config.enable_backpressure:
+                        # Calculate expected playback position
+                        if playback_start_time is None:
+                            playback_start_time = time.perf_counter()
+
+                        elapsed = time.perf_counter() - playback_start_time
+                        expected_samples = int(elapsed * SAMPLE_RATE)
+                        buffer_fill = total_samples_written - expected_samples
+                        max_buffer_samples = int(platform_config.stream_max_buffer * SAMPLE_RATE)
+
+                        # If buffer is too full, pause to let playback catch up
+                        if buffer_fill > max_buffer_samples * platform_config.max_buffer_fill_ratio:
+                            metrics.backpressure_pauses += 1
+                            # Calculate how long to wait
+                            excess_samples = buffer_fill - (max_buffer_samples * 0.4)  # Target 40% fill
+                            wait_time = excess_samples / SAMPLE_RATE
+
+                            if debug:
+                                logger.debug(f"Backpressure: buffer {buffer_fill/SAMPLE_RATE:.2f}s full, "
+                                           f"pausing {wait_time:.3f}s")
+
+                            await asyncio.sleep(wait_time)
+
+                    # Write audio in platform-optimized chunks
+                    playback_chunk_size = platform_config.playback_chunk_size
+                    for i in range(0, len(audio_array), playback_chunk_size):
+                        chunk_slice = audio_array[i:i + playback_chunk_size]
+                        stream.write(chunk_slice)
+                        total_samples_written += len(chunk_slice)
+                        metrics.chunks_played += 1
+
                     if debug and chunk_count % 10 == 0:
-                        logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
+                        logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes, "
+                                   f"{metrics.backpressure_pauses} pauses")
         
         # Wait for playback to finish
+        if total_samples_written > 0:
+            remaining_time = total_samples_written / SAMPLE_RATE
+            if playback_start_time:
+                elapsed = time.perf_counter() - playback_start_time
+                remaining_time = max(0, remaining_time - elapsed)
+
+            if remaining_time > 0:
+                logger.debug(f"Waiting {remaining_time:.2f}s for playback to complete")
+                await asyncio.sleep(remaining_time)
+
         stream.stop()
-        
+
         # Log TTS playback end
         if event_logger:
             event_logger.log_event(event_logger.TTS_PLAYBACK_END)
-        
+
         end_time = time.perf_counter()
         metrics.generation_time = first_chunk_time - start_time if first_chunk_time else 0
         metrics.playback_time = end_time - start_time
-        
-        # Calculate true TTFA based on actual audio playback or chunk receipt
-        if debug and audio_start_time:
-            # Use actual playback start time when available
-            metrics.ttfa = audio_start_time - start_time
-            logger.info(f"True TTFA (audio started): {metrics.ttfa:.3f}s")
-        elif first_chunk_time:
-            # Fall back to first chunk time
-            metrics.ttfa = first_chunk_time - start_time
-            logger.info(f"TTFA (first chunk): {metrics.ttfa:.3f}s")
-        
-        logger.info(f"Streaming complete - TTFA: {metrics.ttfa:.3f}s, "
+        metrics.ttfa = first_chunk_time - start_time if first_chunk_time else 0
+
+        logger.info(f"PCM streaming complete - TTFA: {metrics.ttfa:.3f}s, "
                    f"Total: {metrics.playback_time:.3f}s, "
-                   f"Chunks: {metrics.chunks_received}")
+                   f"Chunks: {metrics.chunks_received}, "
+                   f"Backpressure pauses: {metrics.backpressure_pauses}")
         
         # Save audio if enabled
         if save_audio and save_buffer and audio_dir:
@@ -457,42 +505,42 @@ async def stream_with_buffering(
     conversation_id: Optional[str] = None
 ) -> Tuple[bool, StreamMetrics]:
     """Fallback streaming that buffers enough data to decode reliably.
-    
+
     This is used for formats like MP3, Opus, etc where frame boundaries are critical.
-    For Opus, we download the complete audio before playing.
+    Uses platform-optimized settings for stable playback.
     """
     format = request_params.get('response_format', 'pcm')
-    logger.info(f"Using buffered streaming for format: {format}")
-    
+    platform_config = get_audio_config()
+    logger.info(f"Using buffered streaming for format: {format} (platform: {platform_config.platform_name})")
+
     metrics = StreamMetrics()
     start_time = time.perf_counter()
-    
+
     # Buffer for accumulating chunks
     buffer = io.BytesIO()
     # Separate buffer for saving complete audio
     save_buffer = io.BytesIO() if save_audio else None
     audio_started = False
     stream = None
-    
+
     try:
-        # Setup sounddevice stream
+        # Setup sounddevice stream with platform-optimized settings
         stream = sd.OutputStream(
             samplerate=sample_rate,
             channels=1,
-            dtype='float32'
+            dtype='float32',
+            blocksize=platform_config.blocksize
         )
         stream.start()
-        
-        # Don't add stream parameter - Kokoro defaults to true, OpenAI doesn't support it
         
         # Use the streaming response API for true HTTP streaming
         async with openai_client.audio.speech.with_streaming_response.create(
             **request_params
         ) as response:
             first_chunk_time = None
-            
-            # Stream chunks as they arrive
-            async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+
+            # Stream chunks as they arrive with platform-optimized chunk size
+            async for chunk in response.iter_bytes(chunk_size=platform_config.stream_chunk_size):
                 if chunk:
                     # Track first chunk for TTFA
                     if first_chunk_time is None:
